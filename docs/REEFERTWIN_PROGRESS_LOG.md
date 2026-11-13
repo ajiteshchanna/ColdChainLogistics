@@ -122,3 +122,29 @@
 - **Verification:** Added a dashboard regression test for the manual asset;
   focused dashboard tests and full test execution passed, and Python
   compilation passed.
+
+### CLOUD-001 — Streamlit Community Cloud startup hardening
+
+- **Reproduction:** A temporary project root without `.env` previously raised
+  `ConfigurationError`. Source tracing also found agent SQL configuration and
+  LangGraph/LLM construction at import time.
+- **Implementation:** `load_config` now treats `.env` as optional and applies
+  environment > Streamlit secrets > `.env` precedence. It supports explicit
+  `REEFERTWIN_MODE` and `REEFERTWIN_AI_ENABLED` values. Agent tools load
+  configuration only when invoked, and the orchestrator builds the graph only
+  when the AI page is used. Missing services return typed or degraded states
+  instead of blocking deterministic pages.
+- **Demo mode:** `REEFERTWIN_MODE=demo` keeps deterministic dashboard pages
+  available, disables AI by default, and avoids claims of SQL persistence.
+- **Security:** Streamlit XSRF protection remains enabled and CORS is set to a
+  compatible secure value. Error messages no longer include raw agent or audit
+  exception details.
+- **Documentation:** Added
+  `docs/STREAMLIT_CLOUD_DEPLOYMENT.md` and the placeholder-only
+  `.streamlit/secrets.toml.example`.
+- **Verification:** No-env configuration probe passed; lazy module imports
+  passed; demo UI import succeeded; configuration/optional-service tests
+  passed (`12 passed`); full suite passed (`47 passed`); compileall passed.
+- **Limitation:** Actual Streamlit Community Cloud deployment was not
+  performed, so hosted-provider connectivity and cloud build execution remain
+  unverified.

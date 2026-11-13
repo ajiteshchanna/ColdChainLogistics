@@ -2,13 +2,14 @@
 
 import json
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 
 import requests
 from langchain_core.tools import tool
 from sqlalchemy import text
 
-from src.config import ConfigurationError, load_config
+from src.config import ConfigurationError, ServiceUnavailableError, load_config
 from src.database import create_sql_engine, validate_telemetry_query
 from src.domain.models import Shipment, TelemetryEvent
 from src.predictive.risk import evaluate_cargo_risk as calculate_cargo_risk
@@ -16,7 +17,17 @@ from src.predictive.risk import evaluate_cargo_risk as calculate_cargo_risk
 
 script_dir = Path(__file__).resolve().parent
 project_root = script_dir.parent
-config = load_config(project_root, require_agent=True)
+
+
+@lru_cache(maxsize=1)
+def _get_config():
+    """Load agent configuration only when an external tool is invoked."""
+    try:
+        return load_config(project_root, require_agent=True)
+    except ConfigurationError as exc:
+        raise ServiceUnavailableError(
+            "Agent integrations are not configured."
+        ) from exc
 
 
 def get_cached_huggingface_embeddings(model_name: str):
@@ -45,9 +56,10 @@ def _result(status: str, data: object = None, *, message: str | None = None) -> 
 
 def _get_retriever():
     """Create the SOP retriever only when the SOP tool is actually used."""
+    config = _get_config()
     if not config.pinecone_api_key:
-        raise ConfigurationError(
-            "PINECONE_API_KEY is not configured; SOP retrieval is unavailable."
+        raise ServiceUnavailableError(
+            "SOP retrieval is unavailable because Pinecone is not configured."
         )
 
     from langchain_pinecone import PineconeVectorStore
@@ -92,6 +104,7 @@ def query_telemetry_db(sql_query: str) -> str:
         return _result("error", message=security_error)
 
     try:
+        config = _get_config()
         engine = create_sql_engine(config)
         with engine.connect() as conn:
             cursor = conn.execute(text(sql_query))

@@ -4,7 +4,7 @@ headless = true
 address = "0.0.0.0"
 port = 8501
 enableXsrfProtection = true
-enableCORS = false
+enableCORS = true
 
 [browser]
 gatherUsageStats = false

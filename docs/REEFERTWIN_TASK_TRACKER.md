@@ -32,6 +32,12 @@ before execution.
 | UI-MANUAL-001a | P1 | Add manual navigation | UI-MANUAL-001 | Sidebar includes User Manual and routes to its page | Dashboard source inspection and test | Done |
 | UI-MANUAL-001b | P1 | Render manual content | UI-MANUAL-001a | Existing `docs/USER_MANUAL.md` is loaded as UTF-8 markdown with explicit load errors | Dashboard asset test | Done |
 | UI-MANUAL-001c | P1 | Verify manual tab | UI-MANUAL-001b | Focused tests and compilation pass; evidence is recorded | `pytest` and compileall | Done |
+| CLOUD-001 | P0 | Fix Streamlit Cloud startup | None | UI imports without `.env`, optional services are lazy, and demo mode is explicit | Import smoke, focused tests, full pytest | Done |
+| CLOUD-001a | P0 | Trace cloud configuration | CLOUD-001 | Configuration precedence and import-time service initialization are documented and reproduced | Source trace and no-env probe | Done |
+| CLOUD-001b | P0 | Make integrations lazy | CLOUD-001a | SQL, Ollama, and Pinecone are not required to import the UI; missing services return typed/degraded results | Import and optional-service tests | Done |
+| CLOUD-001c | P0 | Add cloud demo mode | CLOUD-001b | Deterministic pages run with `REEFERTWIN_MODE=demo`; AI and Audit state limitations are honest | Demo configuration and UI import smoke | Done |
+| CLOUD-001d | P1 | Document cloud deployment | CLOUD-001a | Entry point, secrets, precedence, hosted-service requirements, security, and troubleshooting are documented | Documentation review | Done |
+| CLOUD-001e | P0 | Verify cloud regressions | CLOUD-001b, CLOUD-001c, CLOUD-001d | No-env, env/secrets, missing-service, import, demo, and existing tests pass | `pytest -q`, compileall | Done |
 
 ## Completed evidence
 

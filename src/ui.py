@@ -15,9 +15,9 @@ project_root = script_dir.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from src.config import ConfigurationError, load_config
+from src.config import ConfigurationError, ServiceUnavailableError, load_config
 from src.database import create_sql_engine
-from src.orchestrator import fde_agent
+from src.orchestrator import get_agent
 from src.ui_dashboard import (
     get_store,
     render_ai_command_centre,
@@ -30,10 +30,6 @@ from src.ui_dashboard import (
     render_what_if_lab,
 )
 
-
-config = load_config(project_root)
-
-
 def write_audit_log(
     session_id: str,
     node_name: str,
@@ -44,6 +40,10 @@ def write_audit_log(
 ) -> None:
     """Write an agent trace and surface failures to the active operator."""
     try:
+        config = load_config(project_root, require_agent=True)
+        if config.reefertwin_mode == "demo":
+            st.info("Audit logging is unavailable in demo mode.")
+            return
         log_engine = create_sql_engine(config)
         with log_engine.begin() as conn:
             conn.execute(
@@ -66,12 +66,21 @@ def write_audit_log(
                     "status": status,
                 },
             )
-    except Exception as exc:
-        st.warning(f"Audit logging unavailable: {exc}")
+    except Exception:
+        st.warning("Audit logging is unavailable because SQL Server is not configured.")
 
 
 def render_chat() -> None:
     """Render the existing LangGraph chat without mutating twin state."""
+    try:
+        agent = get_agent()
+    except ServiceUnavailableError as exc:
+        st.info(str(exc))
+        return
+    except Exception:
+        st.error("AI Command Centre is unavailable. Check its configured backend.")
+        return
+
     if "ui_messages" not in st.session_state:
         st.session_state.ui_messages = []
     if "thread_id" not in st.session_state:
@@ -99,7 +108,7 @@ def render_chat() -> None:
     with st.chat_message("assistant"):
         with st.status("Running evidence-backed analysis...", expanded=True) as status:
             try:
-                events = fde_agent.stream(
+                events = agent.stream(
                     {"messages": [HumanMessage(content=user_input)]},
                     config=thread_config,
                     stream_mode="updates",
@@ -141,9 +150,9 @@ def render_chat() -> None:
                                         message.content,
                                     )
                 status.update(label="Analysis complete", state="complete")
-            except Exception as exc:
+            except Exception:
                 status.update(label="Analysis failed", state="error")
-                st.error(f"Agent execution failed: {exc}")
+                st.error("Agent execution failed. Check the configured AI backend.")
         if final_response:
             st.markdown(final_response)
             st.session_state.ui_messages.append(
@@ -186,8 +195,8 @@ def render_audit_logs() -> None:
             )
         st.success("Authenticated successfully as Admin.")
         st.dataframe(frame, hide_index=True, use_container_width=True)
-    except Exception as exc:
-        st.error(f"Database query failed: {exc}")
+    except Exception:
+        st.error("Audit log retrieval failed. Verify the configured SQL Server.")
 
 
 st.set_page_config(

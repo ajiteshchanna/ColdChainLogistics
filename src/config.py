@@ -3,13 +3,20 @@
 
 from dataclasses import dataclass
 import os
+import sys
 from pathlib import Path
+from collections.abc import Mapping
+from typing import Any
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 
 
 class ConfigurationError(RuntimeError):
     """Raised when required runtime configuration is missing or invalid."""
+
+
+class ServiceUnavailableError(RuntimeError):
+    """Raised when an optional external service is not configured."""
 
 
 @dataclass(frozen=True)
@@ -34,6 +41,8 @@ class AppConfig:
     pinecone_api_key: str | None
     embeddings_model: str
     local_embedding_model: str
+    reefertwin_mode: str
+    ai_enabled: bool
 
 
 def load_config(
@@ -42,18 +51,21 @@ def load_config(
     require_admin: bool = False,
     require_agent: bool = False,
     load_environment: bool = True,
+    secrets: Mapping[str, Any] | None = None,
 ) -> AppConfig:
     """
     Load and validate application configuration.
 
-    Configuration is loaded from the project's .env file.
-    Existing system environment variables take precedence.
+    Configuration precedence is environment variables, Streamlit secrets,
+    then the optional project `.env` file.
 
     Args:
         project_root: Optional project root directory.
         require_admin: Require SQL administrator credentials.
         require_agent: Require SQL agent credentials.
-        load_environment: Load values from the project `.env` file.
+        load_environment: Read values from the project `.env` file when present.
+        secrets: Optional secret mapping, primarily for isolated tests. When
+            omitted, Streamlit secrets are read when available.
 
     Returns:
         Validated AppConfig instance.
@@ -70,16 +82,13 @@ def load_config(
         else Path(__file__).resolve().parent.parent
     )
 
-    # Load project environment variables
     env_file = root / ".env"
-
-    if not env_file.is_file():
-        raise ConfigurationError(
-            f"Environment file not found: {env_file}"
-        )
-
-    if load_environment:
-        load_dotenv(dotenv_path=env_file, override=False)
+    dotenv_values_map = (
+        dotenv_values(dotenv_path=env_file)
+        if load_environment and env_file.is_file()
+        else {}
+    )
+    secret_values = dict(secrets) if secrets is not None else _streamlit_secrets()
 
     # ---------------------------------------------------------
     # Configuration helpers
@@ -87,7 +96,11 @@ def load_config(
 
     def get_value(name: str, default: str = "") -> str:
         """Read and normalize an environment variable."""
-        return os.getenv(name, default).strip()
+        raw_value = os.environ.get(
+            name,
+            secret_values.get(name, dotenv_values_map.get(name, default)),
+        )
+        return str(raw_value if raw_value is not None else "").strip()
 
     def get_required(
         name: str,
@@ -139,7 +152,7 @@ def load_config(
     # SQL Server configuration
     # ---------------------------------------------------------
 
-    sql_host = get_required("SQL_SERVER_HOST") or "localhost"
+    sql_host = get_value("SQL_SERVER_HOST", "localhost") or "localhost"
 
     sql_port = get_integer(
         "SQL_SERVER_PORT",
@@ -199,7 +212,7 @@ def load_config(
     deepseek_api_key = get_value("DEEPSEEK_API_KEY") or None
     pinecone_api_key = get_value("PINECONE_API_KEY") or None
 
-    if agent_llm == "DEEPSEEK" and not deepseek_api_key:
+    if require_agent and agent_llm == "DEEPSEEK" and not deepseek_api_key:
         raise ConfigurationError(
             "DEEPSEEK_API_KEY is required when Agent_llm=DEEPSEEK."
         )
@@ -223,6 +236,16 @@ def load_config(
             "Local_Embedding_Model cannot be empty."
         )
 
+    reefertwin_mode = get_value("REEFERTWIN_MODE", "local").lower()
+    if reefertwin_mode not in {"local", "demo"}:
+        raise ConfigurationError(
+            "REEFERTWIN_MODE must be either 'local' or 'demo'."
+        )
+    ai_enabled = get_value(
+        "REEFERTWIN_AI_ENABLED",
+        "false" if reefertwin_mode == "demo" else "true",
+    ).lower() in {"1", "true", "yes", "on"}
+
     # ---------------------------------------------------------
     # Return validated configuration
     # ---------------------------------------------------------
@@ -244,4 +267,22 @@ def load_config(
         pinecone_api_key=pinecone_api_key,
         embeddings_model=embeddings_model,
         local_embedding_model=local_embedding_model,
+        reefertwin_mode=reefertwin_mode,
+        ai_enabled=ai_enabled,
     )
+
+
+def _streamlit_secrets() -> dict[str, Any]:
+    """Read flat Streamlit secrets without making Streamlit mandatory."""
+    if "streamlit" not in sys.modules:
+        return {}
+    try:
+        import streamlit as st
+        from streamlit.errors import StreamlitSecretNotFoundError
+    except (ImportError, RuntimeError):
+        return {}
+    try:
+        return dict(st.secrets)
+    except (FileNotFoundError, StreamlitSecretNotFoundError):
+        return {}
+
