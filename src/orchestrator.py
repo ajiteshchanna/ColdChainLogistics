@@ -1,11 +1,11 @@
-import os
+﻿import os
 import sys
 from pathlib import Path
 from dotenv import load_dotenv
 from typing import Annotated, TypedDict
 
 from langchain_core.messages import BaseMessage, SystemMessage
-from langgraph.graph import StateGraph, START, END
+from langgraph.graph import StateGraph, START
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.checkpoint.memory import MemorySaver
@@ -19,9 +19,16 @@ project_root = script_dir.parents[0]
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from src.agent_tools import query_telemetry_db, fetch_corridor_conditions, search_compliance_sop
+from src.agent_tools import (
+    evaluate_cargo_risk,
+    fetch_corridor_conditions,
+    query_telemetry_db,
+    search_compliance_sop,
+)
+from src.config import load_config
 
 load_dotenv(project_root / ".env")
+config = load_config(project_root)
 
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
@@ -30,22 +37,26 @@ class AgentState(TypedDict):
 # 2. FACTORY INITIALIZATION: AGENT REASONER LLM
 # ==========================================
 
-AGENT_LLM_SETTING = os.getenv("Agent_llm", "OLLAMA").strip().upper()
+AGENT_LLM_SETTING = config.agent_llm
 
 if AGENT_LLM_SETTING == "OPENAI":
-    print("🤖 Brain Mode: Utilizing Cloud OpenAI Reasoner (gpt-4o)...")
+    print("Brain Mode: Utilizing Cloud OpenAI Reasoner (gpt-4o)...")
     from langchain_openai import ChatOpenAI
     llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
 elif AGENT_LLM_SETTING == "DEEPSEEK":
-    print("🐳 Brain Mode: Utilizing Flagship DeepSeek Cloud Reasoner (deepseek-v4-pro)...")
+    if not config.deepseek_api_key:
+        raise RuntimeError(
+            "DEEPSEEK_API_KEY is required when Agent_llm=DEEPSEEK."
+        )
+    print("Brain Mode: Utilizing Flagship DeepSeek Cloud Reasoner (deepseek-v4-pro)...")
     from langchain_openai import ChatOpenAI
     
     # Fully updated to match 2026 DeepSeek API parameters and endpoint contracts
     llm = ChatOpenAI(
         model="deepseek-v4-flash",                           # deepseek-v4-flash, deepseek-v4-pro
         temperature=0,
-        openai_api_key=os.getenv("DEEPSEEK_API_KEY"),
+        openai_api_key=config.deepseek_api_key,
         base_url="https://api.deepseek.com",     # Fixed connection string url endpoint
         max_tokens=2048,                                   # Gives the deep reasoner plenty of output runway
         # extra_body={
@@ -55,21 +66,36 @@ elif AGENT_LLM_SETTING == "DEEPSEEK":
     )
 
 else:  # FALLBACK / DEFAULT RUNNER MODE
-    print("🤗 Brain Mode: Local Fallback Activated. Binding Local Ollama (qwen2.5:7b)...")
-    from langchain_community.chat_models import ChatOllama
+    print("Brain Mode: Local Fallback Activated. Binding Local Ollama (qwen2.5:7b)...")
+    from langchain_ollama import ChatOllama
     llm = ChatOllama(model="qwen2.5:7b", temperature=0, num_predict=1024)
 
-fde_tools = [query_telemetry_db, fetch_corridor_conditions, search_compliance_sop]
+fde_tools = [
+    query_telemetry_db,
+    fetch_corridor_conditions,
+    search_compliance_sop,
+    evaluate_cargo_risk,
+]
 llm_with_tools = llm.bind_tools(fde_tools)
 
 # ==========================================
 # 3. GRAPH ARCHITECTURE ASSEMBLY
 # ==========================================
 def reasoning_node(state: AgentState):
-    response = llm_with_tools.invoke(state["messages"])
+    messages = state["messages"]
+    if not any(isinstance(message, SystemMessage) for message in messages):
+        messages = [SystemMessage(content=system_instructions), *messages]
+    response = llm_with_tools.invoke(messages)
     return {"messages": [response]}
 
-print("⚙️ Compiling LangGraph FDE Orchestrator...")
+
+prompt_path = project_root / "src" / "prompts" / "system_prompt.txt"
+try:
+    system_instructions = prompt_path.read_text(encoding="utf-8")
+except OSError as exc:
+    raise RuntimeError(f"Unable to load system prompt from {prompt_path}.") from exc
+
+print("Compiling LangGraph FDE Orchestrator...")
 graph_builder = StateGraph(AgentState)
 graph_builder.add_node("reasoner", reasoning_node)
 graph_builder.add_node("tools", ToolNode(fde_tools))
@@ -85,19 +111,10 @@ fde_agent = graph_builder.compile(checkpointer=MemorySaver())
 # ==========================================
 if __name__ == "__main__":
     print("\n" + "="*55)
-    print("🚀 FDE Supply Chain Orchestrator State Machine Online")
+    print("FDE Supply Chain Orchestrator State Machine Online")
     print(f"   Configured Execution: [LLM: {AGENT_LLM_SETTING}] -> [Embeddings: {os.getenv('Embeddings_model', 'LOCAL')}]")
     print("="*55 + "\n")
     
-    # Load the business-structured system prompt from the external file
-    prompt_path = project_root / "src" / "prompts" / "system_prompt.txt"
-    try:
-        with open(prompt_path, "r", encoding="utf-8") as f:
-            system_instructions = f.read()
-    except FileNotFoundError:
-        print(f"Error: Could not find {prompt_path}")
-        system_instructions = "You are a helpful AI assistant." # Basic fallback
-
     system_prompt = SystemMessage(content=system_instructions)
     
     thread_config = {"configurable": {"thread_id": "production_test_1"}}
@@ -112,8 +129,8 @@ if __name__ == "__main__":
         for event in events:
             for node_name, node_state in event.items():
                 if node_name == "tools":
-                    print("   [System] 🔄 Retrieving external data elements via ToolNode...")
+                    print("   [System] Retrieving external data elements via ToolNode...")
                 elif node_name == "reasoner":
                     latest_msg = node_state["messages"][-1]
                     if latest_msg.content:
-                        print(f"\n🤖 FDE Agent:\n{latest_msg.content}")
+                        print(f"\nFDE Agent:\n{latest_msg.content}")

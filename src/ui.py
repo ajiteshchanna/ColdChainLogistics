@@ -1,297 +1,250 @@
-import os
+"""REEFERTWIN Streamlit command centre."""
+
+import json
 import sys
 import uuid
-import json
-import urllib
 from pathlib import Path
-from dotenv import load_dotenv
-import streamlit as st
+
 import pandas as pd
-from sqlalchemy import create_engine, text
+import streamlit as st
 from langchain_core.messages import HumanMessage, ToolMessage
+from sqlalchemy import text
 
-# ==========================================
-# 1. IMMEDIATE PATH & ENVIRONMENT RESOLUTION
-# ==========================================
-script_dir = Path(__file__).resolve().parent  # points to src/
-project_root = script_dir.parent              # climbs to project root
-
+script_dir = Path(__file__).resolve().parent
+project_root = script_dir.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-load_dotenv(project_root / ".env")
-
-# Import the compiled graph and tools list dynamically
+from src.config import ConfigurationError, load_config
+from src.database import create_sql_engine
 from src.orchestrator import fde_agent
-
-# ==========================================
-# 2. SQL CREDENTIALS MAPPING FROM .ENV
-# ==========================================
-db_host = os.getenv("SQL_SERVER_HOST", "localhost")
-db_port = os.getenv("SQL_SERVER_PORT", "1433")
-db_user = os.getenv("SQL_AGENT_USER", "USR_FDE_RO")
-db_password = os.getenv("SQL_AGENT_PASSWORD")
-
-# Engine for the Agent to write logs using its standard credentials
-connection_string = (
-    f"DRIVER={{ODBC Driver 18 for SQL Server}};"
-    f"SERVER={db_host},{db_port};"
-    f"DATABASE=master;"
-    f"UID={db_user};"
-    f"PWD={db_password};"
-    f"Encrypt=no;"
-    f"TrustServerCertificate=yes;"
+from src.ui_dashboard import (
+    get_store,
+    render_ai_command_centre,
+    render_audit,
+    render_digital_twin,
+    render_fleet,
+    render_overview,
+    render_simulation_lab,
+    render_user_manual,
+    render_what_if_lab,
 )
 
-log_params = urllib.parse.quote_plus(connection_string)
 
-log_engine = create_engine(f"mssql+pyodbc:///?odbc_connect={log_params}")
+config = load_config(project_root)
 
-def write_audit_log(session_id, node_name, tool_name, content):
-    """Silently writes agent execution traces to the SQL audit table using agent permissions."""
+
+def write_audit_log(
+    session_id: str,
+    node_name: str,
+    tool_name: str,
+    content: str,
+    *,
+    status: str = "ok",
+) -> None:
+    """Write an agent trace and surface failures to the active operator."""
     try:
-        with log_engine.connect() as conn:
-            conn.execute(text("""
-                INSERT INTO FDE_VIEWS.AgentAuditLog (SessionID, NodeExecuted, ToolName, Content)
-                VALUES (:session_id, :node_name, :tool_name, :content)
-            """), {
-                "session_id": session_id,
-                "node_name": node_name,
-                "tool_name": tool_name,
-                "content": content
-            })
-            conn.commit()
-    except Exception as e:
-        print(f"Audit Log Failed (Silent): {e}")
+        log_engine = create_sql_engine(config)
+        with log_engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO FDE_VIEWS.AgentAuditLog
+                        (SessionID, NodeExecuted, ToolName, Content, CorrelationID, Status)
+                    VALUES (
+                        :session_id, :node_name, :tool_name, :content,
+                        :correlation_id, :status
+                    )
+                    """
+                ),
+                {
+                    "session_id": session_id,
+                    "node_name": node_name,
+                    "tool_name": tool_name,
+                    "content": content,
+                    "correlation_id": session_id,
+                    "status": status,
+                },
+            )
+    except Exception as exc:
+        st.warning(f"Audit logging unavailable: {exc}")
 
-# ==========================================
-# 3. PAGE CONFIGURATION & ENTERPRISE THEME
-# ==========================================
+
+def render_chat() -> None:
+    """Render the existing LangGraph chat without mutating twin state."""
+    if "ui_messages" not in st.session_state:
+        st.session_state.ui_messages = []
+    if "thread_id" not in st.session_state:
+        st.session_state.thread_id = str(uuid.uuid4())
+    thread_config = {"configurable": {"thread_id": st.session_state.thread_id}}
+
+    for entry in st.session_state.ui_messages:
+        with st.chat_message(entry["role"]):
+            for trace in entry.get("traces", []):
+                with st.expander(f"{trace['type']}: {trace['name']}"):
+                    st.json(trace.get("args", trace.get("content", "")))
+            st.markdown(entry["content"])
+
+    user_input = st.chat_input(
+        "Query fleet telemetry, corridor updates, or compliance thresholds..."
+    )
+    if not user_input:
+        return
+    st.session_state.ui_messages.append({"role": "user", "content": user_input})
+    with st.chat_message("user"):
+        st.markdown(user_input)
+
+    final_response = ""
+    traces: list[dict[str, object]] = []
+    with st.chat_message("assistant"):
+        with st.status("Running evidence-backed analysis...", expanded=True) as status:
+            try:
+                events = fde_agent.stream(
+                    {"messages": [HumanMessage(content=user_input)]},
+                    config=thread_config,
+                    stream_mode="updates",
+                )
+                for event in events:
+                    for node_name, node_state in event.items():
+                        if node_name == "reasoner":
+                            latest_msg = node_state["messages"][-1]
+                            for tool_call in getattr(latest_msg, "tool_calls", []):
+                                traces.append(
+                                    {
+                                        "type": "tool_input",
+                                        "name": tool_call["name"],
+                                        "args": tool_call["args"],
+                                    }
+                                )
+                                write_audit_log(
+                                    st.session_state.thread_id,
+                                    "reasoner",
+                                    tool_call["name"],
+                                    json.dumps(tool_call["args"]),
+                                )
+                            if latest_msg.content:
+                                final_response = latest_msg.content
+                        elif node_name == "tools":
+                            for message in node_state.get("messages", []):
+                                if isinstance(message, ToolMessage):
+                                    traces.append(
+                                        {
+                                            "type": "tool_output",
+                                            "name": message.name or "unknown",
+                                            "content": message.content,
+                                        }
+                                    )
+                                    write_audit_log(
+                                        st.session_state.thread_id,
+                                        "tools",
+                                        message.name or "unknown",
+                                        message.content,
+                                    )
+                status.update(label="Analysis complete", state="complete")
+            except Exception as exc:
+                status.update(label="Analysis failed", state="error")
+                st.error(f"Agent execution failed: {exc}")
+        if final_response:
+            st.markdown(final_response)
+            st.session_state.ui_messages.append(
+                {"role": "assistant", "content": final_response, "traces": traces}
+            )
+
+
+def render_audit_logs() -> None:
+    with st.form("admin_auth_form"):
+        input_user = st.text_input("Admin username")
+        input_pass = st.text_input("Admin password", type="password")
+        submit_admin = st.form_submit_button("Authenticate & load logs")
+    if not submit_admin:
+        return
+    try:
+        admin_config = load_config(project_root, require_admin=True)
+    except ConfigurationError as exc:
+        st.error(str(exc))
+        return
+    if input_user != admin_config.sql_admin_user or input_pass != admin_config.sql_admin_password:
+        st.error("Invalid administrator credentials.")
+        return
+    try:
+        admin_engine = create_sql_engine(
+            admin_config,
+            username=input_user,
+            password=input_pass,
+        )
+        with admin_engine.connect() as conn:
+            frame = pd.read_sql(
+                text(
+                    """
+                    SELECT LogID, Timestamp, SessionID, NodeExecuted,
+                           ToolName, Content, CorrelationID, Status
+                    FROM FDE_VIEWS.AgentAuditLog
+                    ORDER BY Timestamp DESC
+                    """
+                ),
+                conn,
+            )
+        st.success("Authenticated successfully as Admin.")
+        st.dataframe(frame, hide_index=True, use_container_width=True)
+    except Exception as exc:
+        st.error(f"Database query failed: {exc}")
+
+
 st.set_page_config(
-    page_title="FDE Supply Chain Dispatch Console",
+    page_title="REEFERTWIN Command Centre",
     page_icon="🧊",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
+)
+st.markdown(
+    """
+    <style>
+        .stApp { background-color: #0B0E14; color: #E2E8F0; }
+        div[data-testid="stSidebar"] { background-color: #111622; }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
-st.markdown("""
-<style>
-    .stApp { background-color: #0B0E14; color: #E2E8F0; }
-    div[data-testid="stSidebar"] { background-color: #111622; border-right: 1px solid #1E293B; }
-    .stMarkdown code { background-color: #1E293B !important; color: #38BDF8 !important; }
-</style>
-""", unsafe_allow_html=True)
-
-# ==========================================
-# 4. MULTI-USER STATE & THREAD MANAGEMENT
-# ==========================================
-if "thread_id" not in st.session_state:
-    st.session_state.thread_id = str(uuid.uuid4())
-
-if "ui_messages" not in st.session_state:
-    st.session_state.ui_messages = []
-
-thread_config = {"configurable": {"thread_id": st.session_state.thread_id}}
-
-# ==========================================
-# 5. SIDEBAR NAVIGATION & METADATA
-# ==========================================
 with st.sidebar:
-    st.image(str(script_dir / "image_L25X5q.png") if (script_dir / "image_L25X5q.png").exists() else "https://cdn-icons-png.flaticon.com/512/2830/2830305.png", width=65)
-    st.title("FDE Command Center")
-    
-    app_mode = st.radio("System Mode", ["🧊 Dispatch Console", "🛡️ Security & Audit Logs"])
-    
-    st.markdown("---")
-    st.caption(f"Session Token: `{st.session_state.thread_id[:8]}...`")
-    st.markdown(f"**Reasoning Architecture:** `{os.getenv('Agent_llm', 'DEEPSEEK')}`")
-    
-    st.markdown("---")
-    if st.button("🗑️ Purge Dispatch Workspace Session", use_container_width=True):
+    st.title("REEFERTWIN")
+    st.selectbox("Scenario", ["Demo baseline"])
+    st.checkbox("Pause auto-refresh", value=True)
+    page = st.radio(
+        "Command centre",
+        [
+            "Overview",
+            "Digital Twin",
+            "Fleet",
+            "Simulation Lab",
+            "What-if Lab",
+            "AI Command Centre",
+            "Audit",
+            "User Manual",
+        ],
+    )
+    if st.button("Refresh projection", use_container_width=True):
+        st.rerun()
+    st.caption("Refresh is read-only. Simulation advances only from Simulation Lab.")
+    if st.button("Clear AI session", use_container_width=True):
         st.session_state.ui_messages = []
         st.session_state.thread_id = str(uuid.uuid4())
         st.rerun()
 
-# ==========================================
-# 6. VIEW ROUTING (DISPATCH VS AUDIT)
-# ==========================================
-
-if app_mode == "🧊 Dispatch Console":
-    # ------------------------------------------
-    # TAB 1: CHAT UI & AGENT EXECUTION
-    # ------------------------------------------
-    st.title("Cold-Chain Incident Control Dashboard")
-    st.caption("Production Data Engineering Pipeline • Real-Time Decision Optimization Platform")
-
-    for entry in st.session_state.ui_messages:
-        with st.chat_message(entry["role"], avatar="👤" if entry["role"] == "user" else "🤖"):
-            if "traces" in entry:
-                for trace in entry["traces"]:
-                    if trace["type"] == "tool_input":
-                        st.markdown(f"**⚡ Intent Recognized:** `{trace['name']}`")
-                        with st.expander(f"📥 View Generated Input ({trace['name']})", expanded=False):
-                            st.json(trace["args"])
-                    elif trace["type"] == "tool_output":
-                        with st.expander(f"📤 View Raw Output ({trace['name']})", expanded=False):
-                            st.code(trace["content"], language="text")
-            st.markdown(entry["content"])
-
-    if user_input := st.chat_input("Query fleet telemetry, corridor updates, or compliance thresholds..."):
-        
-        st.session_state.ui_messages.append({"role": "user", "content": user_input})
-        with st.chat_message("user", avatar="👤"):
-            st.markdown(user_input)
-
-        with st.chat_message("assistant", avatar="🤖"):
-            final_response = ""
-            current_traces = [] 
-            
-            with st.status("🧠 Initializing Core Reasoner Node...", expanded=True) as status:
-                events = fde_agent.stream(
-                    {"messages": [HumanMessage(content=user_input)]}, 
-                    config=thread_config,
-                    stream_mode="updates"
-                )
-                
-                for event in events:
-                    for node_name, node_state in event.items():
-                        
-                        if node_name == "reasoner":
-                            latest_msg = node_state["messages"][-1]
-                            
-                            # A. Intercept Tool Call Requests (Inputs)
-                            if hasattr(latest_msg, "tool_calls") and latest_msg.tool_calls:
-                                status.update(label="🧠 Agent generated tool parameters...")
-                                for tool_call in latest_msg.tool_calls:
-                                    st.markdown(f"**⚡ Intent Recognized:** `{tool_call['name']}`")
-                                    with st.expander(f"📥 View Generated Input ({tool_call['name']})", expanded=False):
-                                        st.json(tool_call['args'])
-                                    
-                                    current_traces.append({
-                                        "type": "tool_input",
-                                        "name": tool_call['name'],
-                                        "args": tool_call['args']
-                                    })
-                                    
-                                    write_audit_log(
-                                        session_id=st.session_state.thread_id,
-                                        node_name="reasoner",
-                                        tool_name=tool_call['name'],
-                                        content=json.dumps(tool_call['args'])
-                                    )
-                            
-                            # B. Intercept Final Generation
-                            if latest_msg.content:
-                                final_response = latest_msg.content
-                                status.update(label="📝 Generating Operational Resolution Report...")
-                                
-                                write_audit_log(
-                                    session_id=st.session_state.thread_id,
-                                    node_name="reasoner_final",
-                                    tool_name="LLM Text Synthesis",
-                                    content=final_response
-                                )
-                                
-                        elif node_name == "tools":
-                            status.update(label="🔧 Executing Enterprise Subsystem Tools...")
-                            for msg in node_state.get("messages", []):
-                                if isinstance(msg, ToolMessage):
-                                    with st.expander(f"📤 View Raw Output ({msg.name})", expanded=False):
-                                        st.code(msg.content, language="text")
-                                        
-                                    current_traces.append({
-                                        "type": "tool_output",
-                                        "name": msg.name,
-                                        "content": msg.content
-                                    })
-                                    
-                                    write_audit_log(
-                                        session_id=st.session_state.thread_id,
-                                        node_name="tools",
-                                        tool_name=msg.name,
-                                        content=msg.content
-                                    )
-                
-                status.update(label="Incident Matrix Evaluation Complete", state="complete", expanded=False)
-                
-            if final_response:
-                st.markdown(final_response)
-                st.session_state.ui_messages.append({
-                    "role": "assistant",
-                    "content": final_response,
-                    "traces": current_traces
-                })
-            else:
-                error_fallback = "⚠️ Execution Timeout: System engine encountered an unresolved processing edge case."
-                st.error(error_fallback)
-
-
-elif app_mode == "🛡️ Security & Audit Logs":
-    # ------------------------------------------
-    # TAB 2: AUDIT LOG VIEWER (REQUIRES ADMIN CREDENTIALS FROM .ENV OR INPUT)
-    # ------------------------------------------
-    st.title("🛡️ Enterprise Agent Audit Trail")
-    st.caption("Secure database inspection of FDE_VIEWS.AgentAuditLog")
-    
-    st.markdown("### Database Authorization Gate")
-    st.markdown("Enter high-privilege administrative credentials (defined in `.env` as `SQL_ADMIN_USER`) to query audit logs.")
-    
-    with st.form("admin_auth_form"):
-        col1, col2 = st.columns(2)
-        with col1:
-            input_user = st.text_input("Admin Username", value=os.getenv("SQL_ADMIN_USER", ""))
-        with col2:
-            input_pass = st.text_input("Admin Password", type="password", value="")
-            
-        submit_admin = st.form_submit_button("Authenticate & Load Logs", use_container_width=True)
-
-    if submit_admin:
-        expected_admin_user = os.getenv("SQL_ADMIN_USER")
-        expected_admin_pass = os.getenv("SQL_ADMIN_PASSWORD")
-        
-        if input_user == expected_admin_user and input_pass == expected_admin_pass:
-            try:
-                # Build an isolated admin connection string for viewing data
-                admin_params = urllib.parse.quote_plus(
-                    "DRIVER={ODBC Driver 18 for SQL Server};"
-                    f"SERVER={db_host},{db_port};"
-                    "DATABASE=master;"
-                    f"UID={input_user};"
-                    f"PWD={input_pass};"
-                    "Encrypt=no;"
-                    "TrustServerCertificate=yes;"
-                )
-                admin_engine = create_engine(f"mssql+pyodbc:///?odbc_connect={admin_params}")
-                
-                with admin_engine.connect() as conn:
-                    query = """
-                        SELECT LogID, Timestamp, SessionID, NodeExecuted, ToolName, Content 
-                        FROM FDE_VIEWS.AgentAuditLog 
-                        ORDER BY Timestamp DESC
-                    """
-                    df = pd.read_sql(query, conn)
-                
-                st.success("✅ Authenticated successfully as Admin.")
-                
-                if not df.empty:
-                    st.dataframe(
-                        df,
-                        column_config={
-                            "LogID": st.column_config.NumberColumn("ID", format="%d"),
-                            "Timestamp": st.column_config.DatetimeColumn("Execution Time", format="DD/MM/YYYY-h:mm a"),
-                            "SessionID": "Session Token",
-                            "NodeExecuted": "Graph Node",
-                            "ToolName": "Tool Triggered",
-                            "Content": "Raw Payload Data"
-                        },
-                        hide_index=True,
-                        use_container_width=True,
-                        height=600
-                    )
-                else:
-                    st.info("No audit logs found in the database. Run a query in the Dispatch Console first.")
-                    
-            except Exception as e:
-                st.error(f"Database Query Failed: {e}")
-        else:
-            st.error("❌ Invalid Administrator Credentials.")
+store = get_store()
+if page == "Overview":
+    render_overview(store)
+elif page == "Digital Twin":
+    render_digital_twin(store)
+elif page == "Fleet":
+    render_fleet(store)
+elif page == "Simulation Lab":
+    render_simulation_lab(store)
+elif page == "What-if Lab":
+    render_what_if_lab(store)
+elif page == "AI Command Centre":
+    render_ai_command_centre(render_chat)
+elif page == "User Manual":
+    render_user_manual()
+else:
+    render_audit(render_audit_logs)

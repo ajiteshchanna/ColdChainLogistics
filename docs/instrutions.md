@@ -6,22 +6,22 @@
 - Create and EC2 instance > docker container > mcr.microsoft.com/mssql/server:2022-latest
 - Spin up the Legacy MSSQL Server
 ```
-docker run -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=FdeEnterprisePass123!" -p 1433:1433 --name legacy-mssql -d mcr.microsoft.com/mssql/server:2022-latest
+docker run -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=<strong-secret>" -p 1433:1433 --name legacy-mssql -d mcr.microsoft.com/mssql/server:2022-latest
 
 # or multi-line in windows 
-docker run -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=FdeEnterprisePass123!" ^
+docker run -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=<strong-secret>" ^
    -p 1433:1433 --name legacy-mssql ^
    -d mcr.microsoft.com/mssql/server:2022-latest
 
 # or multi-line unix
-docker run -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=FdeEnterprisePass123!" \
+docker run -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=<strong-secret>" \
    -p 1433:1433 --name legacy-mssql \
    -d mcr.microsoft.com/mssql/server:2022-latest
 
 # or multi-line with volume inside EC2
 docker run -v mssql_data:/var/opt/mssql \
   -e "ACCEPT_EULA=Y" \
-  -e "MSSQL_SA_PASSWORD=FdeEnterprisePass123!" \
+  -e "MSSQL_SA_PASSWORD=<strong-secret>" \
   -p 1433:1433 \
   --name legacy-mssql \
   -d mcr.microsoft.com/mssql/server:2022-latest
@@ -29,7 +29,63 @@ docker run -v mssql_data:/var/opt/mssql \
 ```
 - install the req > pip install -r requirements.txt
 
+Before running Python scripts, create a local `.env` file from a secret
+manager or deployment environment. Do not commit it:
+```
+SQL_SERVER_HOST=localhost
+SQL_SERVER_PORT=1433
+SQL_DATABASE=master
+SQL_ADMIN_USER=sa
+SQL_ADMIN_PASSWORD=<admin-secret>
+SQL_AGENT_USER=USR_FDE_RO
+SQL_AGENT_PASSWORD=<agent-secret>
+SQL_CONNECT_TIMEOUT_SECONDS=10
+Agent_llm=OLLAMA
+```
+
+Validate configuration before connecting:
+```
+python scripts\check_startup.py
+python scripts\check_startup.py --check-sql
+```
+
 - python scripts\ingest_legacy_data.py
+
+## Phase 1: Twin schema and deterministic fleet
+
+After the legacy view/security setup is complete, apply the Phase 1 migration
+with the same SQL administrator connection:
+```
+sqlcmd -S localhost,1433 -d master -U sa -P "<admin-secret>" ^
+  -i scripts\migrations\001_create_twin_schema.sql
+```
+
+Seed five reproducible Mumbai–Pune refrigerated vehicles, shipments, routes,
+and warehouses:
+```
+python scripts\seed_twin.py
+```
+
+The simulator can be exercised without SQL:
+```
+python -c "from src.twin.telemetry_simulator import build_demo_fleet, TelemetrySimulator; s=TelemetrySimulator(build_demo_fleet(), seed=42); print(s.tick())"
+```
+
+The original `dbo.TBL_SC_FLEET_HIST_RAW` data is not modified. Phase 1
+telemetry is stored in the `Twin` schema and is labelled `simulator`.
+
+## Phase 2: predictive intelligence and audit metadata
+
+Apply the Phase 2 audit migration after the Phase 1 schema:
+```
+sqlcmd -S localhost,1433 -d master -U sa -P "<admin-secret>" ^
+  -i scripts\migrations\002_extend_phase2_audit.sql
+```
+
+The deterministic risk engine reports `normal`, `warning`, `critical`, or
+`unknown`. It estimates temperature-threshold crossing time only; it does not
+claim spoilage or remaining shelf life. External weather failures are reported
+as `degraded`, and operational actions require an explicit approval state.
 
 ## Connecting to the data 
 
@@ -47,7 +103,7 @@ We need to query the database
    Trust server certificate: 🟩 Check this box / turn it ON (Crucial for Docker)
    Authentication type*: SQL Login
    User name*: sa
-   Password*: FdeEnterprisePass123!
+   Password*: Use the secret supplied when the container was created
    Save Password: 🟩 Check this box
    Database name: Type master (or leave it on "Select a database")
    Encrypt: ⚠️ Change this from Mandatory to Optional (or False)
@@ -69,7 +125,7 @@ We need to query the database
 ```
 docker run -v mssql_data:/var/opt/mssql \
   -e "ACCEPT_EULA=Y" \
-  -e "MSSQL_SA_PASSWORD=FdeEnterprisePass123!" \
+  -e "MSSQL_SA_PASSWORD=<strong-secret>" \
   -p 1433:1433 \
   --name legacy-mssql \
   -d mcr.microsoft.com/mssql/server:2022-latest
@@ -88,7 +144,9 @@ docker run -v mssql_data:/var/opt/mssql \
 
 ## Data Security
 
-- Click on file : scripts\setup_security_and_view.sql
+- Click on file : scripts\setup_security_and_view.sql. Run it with the
+  `FDE_AGENT_PASSWORD` SQLCMD variable set to the same value as
+  `SQL_AGENT_PASSWORD`; the password is never stored in the SQL file.
 - VS-code will show you Start button directly on top else run like we were running the commands previously.
 - Once done, create a new connection now with Agent-Profile
 ```
@@ -100,7 +158,7 @@ docker run -v mssql_data:/var/opt/mssql \
 * Trust server certificate: 🟩 Check this box / Turn it ON
 * Authentication type*: SQL Login
 * User name*: USR_FDE_RO
-* Password*: AgentPassword2026!
+* Password*: Read `SQL_AGENT_PASSWORD` from the environment; never commit it
 * Save Password: 🟩 Check this box / Turn it ON
 * Database name: Type master (or click "Select a database" and select master)
 * Encrypt: Change this from Mandatory to Optional (or False)
@@ -115,10 +173,69 @@ SELECT TOP 5 * FROM FDE_VIEWS.VW_ACTIVE_FLEET;
 SELECT TOP 5 * FROM dbo.TBL_SC_FLEET_HIST_RAW;
 ```
 
-## Phase 3
+## Phase 3: REEFERTWIN command centre
 
-run src\agent_tools.py
-run src\orchestrator.py
+Install the pinned dependencies, including PyDeck, and start the Streamlit
+application:
+```
+pip install -r requirements.txt
+streamlit run src\ui.py
+```
+
+The command centre provides Overview, Digital Twin, Fleet, Simulation Lab, AI
+Command Centre, and Audit pages. The demo projection is held in Streamlit
+session state: refreshes and page changes are read-only, while the Simulation
+Lab advances state only after an explicit 1-, 5-, or 15-minute action. Reset
+uses the fixed seed and reproduces the same baseline observations. PyDeck
+renders the Mumbai–Pune route and risk-coloured vehicle markers; if PyDeck is
+unavailable, the UI falls back to a map and coordinate table.
+
+The AI Command Centre retains the existing LangGraph chat flow. Configure the
+SQL and LLM secrets before using it; the local twin pages do not require live
+SQL connectivity.
+
+## Phase 4: what-if simulation and optimization
+
+Use the **What-if Lab** page to create an isolated scenario for
+`REEFER-003`. Supported disruptions are compressor failure, heatwave,
+temperature spike, traffic congestion, highway closure, capacity reduction,
+and warehouse unavailability. Each scenario receives a mandatory scenario ID
+and copies baseline telemetry/projections; creating or refreshing a scenario
+does not modify the baseline.
+
+The page compares baseline and disrupted temperature/risk, evaluates every
+warehouse, and displays rejection reasons for capacity, temperature range,
+availability, route, or deadline failures. Route estimates use the
+deterministic offline fixture unless a live OSRM adapter is configured.
+
+A diversion follows the explicit lifecycle:
+`proposed -> approved -> executed`. Execution is blocked until approval and
+changes only the selected scenario projection. If no facility is feasible,
+the UI reports an explicit human-logistics escalation instead of inventing a
+destination.
+
+## Phase 5: deployment and operations
+
+Run the local readiness check:
+```
+python scripts\health_check.py
+python scripts\health_check.py --check-sql
+```
+
+Build and run the pinned container:
+```
+docker compose up --build
+```
+
+The container listens on port `8501`, excludes `.env` from the image, and
+reports a health status through the Docker health check. The GitHub Actions
+workflow runs compile, unit-test, offline-health, and container-build gates on
+`main`. Deployment remains manual and runs the same startup/test gates on the
+EC2 host before restarting Streamlit and checking `/_stcore/health`.
+
+Apply SQL migrations separately with an administrator/migration identity.
+Runtime secrets belong in GitHub/EC2 secret storage or the host environment;
+do not place them in the image, repository, or workflow command output.
 
 Step-1 : Pass below in the dispatcher >
 - Question-1 (The "Domino Effect" Test)
